@@ -4,8 +4,6 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    expose:
-      - "3000"
     network_mode: service:tailscale
     depends_on:
       - tailscale
