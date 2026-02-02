@@ -126,9 +126,12 @@ async function fetchWorkoutsFromTrainingPeaks(userKey) {
           existing.distance = api.distance ? formatDistance(api.distance) : existing.distance;
           existing.tss = api.tssActual ? `${Math.round(api.tssActual)} TSS` : existing.tss;
         } else if (!isCompleted && !existing.isPlanned) {
-          // Planned version, but we already have completed - merge description
+          // Planned version, but we already have completed - merge description and steps
           if (!existing.description && api.description) {
             existing.description = api.description;
+          }
+          if (!existing.steps && api.structure) {
+            existing.steps = formatSteps(api.structure);
           }
         }
         continue;
@@ -141,7 +144,8 @@ async function fetchWorkoutsFromTrainingPeaks(userKey) {
         distance: formatDistance(api.distance || api.distancePlanned),
         tss: (api.tssActual || api.tssPlanned) ? `${Math.round(api.tssActual || api.tssPlanned)} TSS` : null,
         isPlanned: !isCompleted,
-        description: api.description || api.coachComments || null
+        description: api.description || api.coachComments || null,
+        steps: formatSteps(api.structure)
       });
     }
 
@@ -182,6 +186,31 @@ function formatDistance(meters) {
     return `${(meters / 1000).toFixed(1)} km`;
   }
   return `${Math.round(meters)} m`;
+}
+
+function formatSteps(structure) {
+  if (!structure?.structure) return null;
+
+  const steps = [];
+  for (const block of structure.structure) {
+    const reps = block.length?.unit === 'repetition' ? block.length.value : 1;
+    const prefix = reps > 1 ? `${reps}x ` : '';
+
+    for (const step of (block.steps || [])) {
+      const name = step.name || step.intensityClass || 'Step';
+      const len = step.length;
+      let duration = '';
+      if (len) {
+        if (len.unit === 'meter') duration = `${len.value}m`;
+        else if (len.unit === 'second') duration = `${len.value}s`;
+        else if (len.unit === 'minute') duration = `${len.value}min`;
+        else duration = `${len.value} ${len.unit}`;
+      }
+      const notes = step.notes ? ` - ${step.notes}` : '';
+      steps.push(`${prefix}${name}${duration ? ` (${duration})` : ''}${notes}`);
+    }
+  }
+  return steps.length > 0 ? steps : null;
 }
 
 /**
@@ -239,6 +268,7 @@ function formatAsMarkdown(data) {
       if (w.distance) md += `- **Distance:** ${w.distance}\n`;
       if (w.tss) md += `- **TSS:** ${w.tss}\n`;
       if (w.description) md += `\n${w.description}\n`;
+      if (w.steps) md += `\n**Steps:**\n${w.steps.map(s => `- ${s}`).join('\n')}\n`;
       md += '\n';
     });
     md += '---\n\n';
@@ -277,6 +307,7 @@ function formatAsICS(data) {
     if (workout.distance) description += `Distance: ${workout.distance}\n`;
     if (workout.tss) description += `TSS: ${workout.tss}\n`;
     if (workout.description) description += `\n${workout.description}`;
+    if (workout.steps) description += `\n\nSteps:\n${workout.steps.join('\n')}`;
 
     lines.push('BEGIN:VEVENT');
     lines.push(`UID:${uid}`);
