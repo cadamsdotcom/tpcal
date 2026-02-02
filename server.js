@@ -76,9 +76,6 @@ async function fetchWorkoutsFromTrainingPeaks(userKey) {
       await page.waitForTimeout(4000);
     }
 
-    // Save debug screenshot
-    await page.screenshot({ path: `debug-${userKey}.png`, fullPage: true });
-
     // Extract workout data with dates using DOM structure
     const data = await page.evaluate(() => {
       const workouts = [];
