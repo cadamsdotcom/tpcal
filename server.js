@@ -98,6 +98,11 @@ async function fetchWorkoutsFromTrainingPeaks(userKey) {
 
         if (!title || title.length < 2 || title.length > 100) return;
         if (title.match(/^(Metrics|Sleep|HRV|Time in|Body Battery|Stress|Resting|Performance|Upgrade|Sample)/i)) return;
+        // Filter out titles that are just metrics/durations
+        if (title.match(/^\d{1,2}:\d{2}(:\d{2})?/)) return; // Duration like "0:38:00"
+        if (title.match(/^\d+\.?\d*\s*(m|km|mi|TSS)$/i)) return; // Distance/TSS like "2100 m"
+        if (title.match(/^\d+\s*TSS$/i)) return; // Just TSS
+        if (title.match(/^--/)) return; // Placeholder values
 
         // Try to find date from parent elements
         let date = null;
@@ -309,16 +314,21 @@ function formatAsICS(data) {
     const dateStr = formatICSDate(eventDate);
 
     let description = '';
-    if (workout.duration) description += `Duration: ${workout.duration}\\n`;
-    if (workout.distance) description += `Distance: ${workout.distance}\\n`;
-    if (workout.tss) description += `TSS: ${workout.tss}\\n`;
-    if (workout.description) description += `\\n${workout.description}`;
+    if (workout.duration) description += `Duration: ${workout.duration}\n`;
+    if (workout.distance) description += `Distance: ${workout.distance}\n`;
+    if (workout.tss) description += `TSS: ${workout.tss}\n`;
+    if (workout.description) description += `\n${workout.description}`;
+
+    // For all-day events, DTEND should be the next day
+    const nextDay = new Date(eventDate);
+    nextDay.setDate(nextDay.getDate() + 1);
+    const endDateStr = formatICSDate(nextDay);
 
     lines.push('BEGIN:VEVENT');
     lines.push(`UID:${uid}`);
     lines.push(`DTSTAMP:${formatICSDateTime(new Date())}`);
     lines.push(`DTSTART;VALUE=DATE:${dateStr}`);
-    lines.push(`DTEND;VALUE=DATE:${dateStr}`);
+    lines.push(`DTEND;VALUE=DATE:${endDateStr}`);
     lines.push(`SUMMARY:${escapeICS(workout.title)}${workout.isPlanned ? ' (Planned)' : ''}`);
     if (description) lines.push(`DESCRIPTION:${escapeICS(description)}`);
     lines.push(workout.isPlanned ? 'STATUS:TENTATIVE' : 'STATUS:CONFIRMED');
@@ -339,6 +349,12 @@ function parseWorkoutDate(dateStr) {
     const tomorrow = new Date(now);
     tomorrow.setDate(tomorrow.getDate() + 1);
     return tomorrow;
+  }
+
+  // Handle ISO format "YYYY-MM-DD"
+  const isoMatch = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (isoMatch) {
+    return new Date(parseInt(isoMatch[1]), parseInt(isoMatch[2]) - 1, parseInt(isoMatch[3]));
   }
 
   // Handle "Month Day, Year" format
