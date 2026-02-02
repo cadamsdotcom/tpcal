@@ -268,7 +268,7 @@ function formatAsMarkdown(data) {
       if (w.distance) md += `- **Distance:** ${w.distance}\n`;
       if (w.tss) md += `- **TSS:** ${w.tss}\n`;
       if (w.description) md += `\n${w.description}\n`;
-      if (w.steps) md += `\n**Steps:**\n${w.steps.map(s => `- ${s}`).join('\n')}\n`;
+      if (w.steps) md += `\n**Steps:**\n\n${w.steps.map((s, i) => `${i + 1}. ${s}`).join('\n\n')}\n`;
       md += '\n';
     });
     md += '---\n\n';
@@ -307,7 +307,7 @@ function formatAsICS(data) {
     if (workout.distance) description += `Distance: ${workout.distance}\n`;
     if (workout.tss) description += `TSS: ${workout.tss}\n`;
     if (workout.description) description += `\n${workout.description}`;
-    if (workout.steps) description += `\n\nSteps:\n${workout.steps.join('\n')}`;
+    if (workout.steps) description += `\n\nSteps:\n\n${workout.steps.map((s, i) => `${i + 1}. ${s}`).join('\n\n')}`;
 
     lines.push('BEGIN:VEVENT');
     lines.push(`UID:${uid}`);
