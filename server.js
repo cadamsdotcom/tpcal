@@ -208,14 +208,17 @@ async function fetchWorkoutsFromTrainingPeaks(userKey) {
       };
     });
 
-    // Dedupe workouts
-    const seen = new Set();
-    const uniqueWorkouts = data.workouts.filter(w => {
-      const key = `${w.title}|${w.date}|${w.duration}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
+    // Dedupe workouts by title+date, preferring completed over planned
+    const workoutMap = new Map();
+    data.workouts.forEach(w => {
+      const key = `${w.title}|${w.date}`;
+      const existing = workoutMap.get(key);
+      // Keep completed (has duration) over planned, or first one if same type
+      if (!existing || (w.duration && !existing.duration)) {
+        workoutMap.set(key, w);
+      }
     });
+    const uniqueWorkouts = Array.from(workoutMap.values());
 
     return {
       user: userKey,
