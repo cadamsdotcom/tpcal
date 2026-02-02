@@ -33,6 +33,22 @@ if (Object.keys(USERS).length === 0) {
 // Per-user cache
 const cache = {};
 const CACHE_DURATION_MS = 24 * 60 * 60 * 1000; // 24 hours
+const SECRET = process.env.API_SECRET;
+
+if (!SECRET) {
+  console.error('API_SECRET env var required');
+  process.exit(1);
+}
+
+// Auth middleware - require ?secret=xxx
+function requireSecret(req, res, next) {
+  if (req.query.secret !== SECRET) {
+    return res.status(404).send('Not found');
+  }
+  next();
+}
+
+app.use(requireSecret);
 
 /**
  * Fetches workouts from TrainingPeaks for a specific user
