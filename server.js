@@ -5,26 +5,21 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Load users from environment variables
-// Format: TP_<USER>_USERNAME and TP_<USER>_PASSWORD
 function loadUsersFromEnv() {
   const users = {};
   const envKeys = Object.keys(process.env);
-
-  // Find all TP_*_USERNAME entries
   const userKeys = envKeys
     .filter(k => k.startsWith('TP_') && k.endsWith('_USERNAME'))
-    .map(k => k.slice(3, -9).toLowerCase()); // Extract user key
+    .map(k => k.slice(3, -9).toLowerCase());
 
   for (const userKey of userKeys) {
     const envPrefix = `TP_${userKey.toUpperCase()}`;
     const username = process.env[`${envPrefix}_USERNAME`];
     const password = process.env[`${envPrefix}_PASSWORD`];
-
     if (username && password) {
       users[userKey] = { username, password };
     }
   }
-
   return users;
 }
 
@@ -32,13 +27,12 @@ const USERS = loadUsersFromEnv();
 
 if (Object.keys(USERS).length === 0) {
   console.error('No users configured. Set TP_<USER>_USERNAME and TP_<USER>_PASSWORD env vars.');
-  console.error('Example: TP_CHRIS_USERNAME=myuser TP_CHRIS_PASSWORD=mypass');
   process.exit(1);
 }
 
 // Per-user cache
 const cache = {};
-const CACHE_DURATION_MS = 24 * 60 * 60 * 1000; // 24 hours (once per day)
+const CACHE_DURATION_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 /**
  * Fetches workouts from TrainingPeaks for a specific user
@@ -54,6 +48,22 @@ async function fetchWorkoutsFromTrainingPeaks(userKey) {
   const page = await context.newPage();
 
   try {
+    // Intercept API responses to get full workout data
+    const apiWorkouts = [];
+    page.on('response', async (response) => {
+      const url = response.url();
+      if (url.includes('/workouts') || url.includes('/activities')) {
+        try {
+          const json = await response.json();
+          if (Array.isArray(json)) {
+            apiWorkouts.push(...json);
+          } else if (json.workouts) {
+            apiWorkouts.push(...json.workouts);
+          }
+        } catch (e) {}
+      }
+    });
+
     // Login
     await page.goto('https://home.trainingpeaks.com/login');
     await page.waitForSelector('input[name="Username"], input[type="email"]', { timeout: 15000 });
@@ -66,7 +76,7 @@ async function fetchWorkoutsFromTrainingPeaks(userKey) {
     await page.waitForURL('**/app.trainingpeaks.com/**', { timeout: 30000 }).catch(() => {});
     await page.waitForTimeout(4000);
 
-    // Navigate to calendar
+    // Navigate to calendar to trigger API calls
     console.log('Navigating to calendar...');
     try {
       await page.click('text=Calendar', { timeout: 5000 });
@@ -76,162 +86,86 @@ async function fetchWorkoutsFromTrainingPeaks(userKey) {
       await page.waitForTimeout(4000);
     }
 
-    // Extract workout data with dates using DOM structure
-    const data = await page.evaluate(() => {
-      const workouts = [];
+    // Wait for API calls to complete
+    await page.waitForTimeout(2000);
+    console.log(`Intercepted ${apiWorkouts.length} workouts from API`);
 
-      // Get current month/year from the page header
-      const monthYearEl = document.querySelector('[class*="month"], h1, h2');
-      const monthYearText = monthYearEl?.textContent || '';
-      const monthMatch = monthYearText.match(/(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})/i);
-      const currentMonth = monthMatch ? monthMatch[1] : new Date().toLocaleString('en', { month: 'long' });
-      const currentYear = monthMatch ? monthMatch[2] : new Date().getFullYear();
+    // Process API workouts into our format
+    // First pass: collect all workouts, merging planned details into completed
+    const seen = new Map();
+    for (const api of apiWorkouts) {
+      const date = api.workoutDay?.split('T')[0] || null;
+      const title = api.title || 'Workout';
+      const key = `${title}|${date}`;
+      const isCompleted = api.totalTime && api.totalTime > 0;
 
-      // Find workout cards/items in the DOM
-      const workoutElements = document.querySelectorAll('[class*="workout"], [class*="Workout"], [class*="activity"], [class*="Activity"]');
+      const existing = seen.get(key);
 
-      workoutElements.forEach(el => {
-        // Try to get title
-        const titleEl = el.querySelector('[class*="title"], [class*="Title"], [class*="name"], h3, h4, strong') || el;
-        let title = titleEl?.textContent?.trim() || '';
-        title = title.split('\n')[0].trim();
-
-        if (!title || title.length < 2 || title.length > 100) return;
-        if (title.match(/^(Metrics|Sleep|HRV|Time in|Body Battery|Stress|Resting|Performance|Upgrade|Sample)/i)) return;
-        // Filter out titles that are just metrics/durations
-        if (title.match(/^\d{1,2}:\d{2}(:\d{2})?/)) return; // Duration like "0:38:00"
-        if (title.match(/^\d+\.?\d*\s*(m|km|mi|TSS)$/i)) return; // Distance/TSS like "2100 m"
-        if (title.match(/^\d+\s*TSS$/i)) return; // Just TSS
-        if (title.match(/^--/)) return; // Placeholder values
-
-        // Try to find date from parent elements
-        let date = null;
-        let parent = el.parentElement;
-        for (let i = 0; i < 10 && parent; i++) {
-          if (parent.dataset?.date) {
-            date = parent.dataset.date;
-            break;
+      // Merge: if we have a completed and planned version, combine them
+      if (existing) {
+        if (isCompleted && existing.isPlanned) {
+          // Completed version - keep planned description, update with actual data
+          existing.isPlanned = false;
+          existing.duration = formatDurationHours(api.totalTime);
+          existing.distance = api.distance ? formatDistance(api.distance) : existing.distance;
+          existing.tss = api.tssActual ? `${Math.round(api.tssActual)} TSS` : existing.tss;
+        } else if (!isCompleted && !existing.isPlanned) {
+          // Planned version, but we already have completed - merge description
+          if (!existing.description && api.description) {
+            existing.description = api.description;
           }
-          if (parent.textContent?.includes('Today') && parent.textContent.length < 50) {
-            const dayMatch = parent.textContent.match(/Today\s*(\d{1,2})?/);
-            if (dayMatch && dayMatch[1]) {
-              date = `${currentMonth} ${dayMatch[1]}, ${currentYear}`;
-            } else {
-              date = 'Today';
-            }
-            break;
-          }
-          const dayNumMatch = parent.textContent?.match(/^(\d{1,2})\s/);
-          if (dayNumMatch) {
-            date = `${currentMonth} ${dayNumMatch[1]}, ${currentYear}`;
-            break;
-          }
-          parent = parent.parentElement;
         }
+        continue;
+      }
 
-        // Get duration
-        const durationMatch = el.textContent.match(/(\d{1,2}:\d{2}:\d{2})/);
-        const duration = durationMatch ? durationMatch[1] : null;
-        const isPlanned = el.textContent.includes('--:--:--') || !duration;
-
-        // Get distance
-        const distanceMatch = el.textContent.match(/(\d+\.?\d*)\s*(km|m|mi)/i);
-        const distance = distanceMatch ? `${distanceMatch[1]} ${distanceMatch[2]}` : null;
-
-        // Get TSS
-        const tssMatch = el.textContent.match(/(\d+)\s*TSS/i);
-        const tss = tssMatch ? `${tssMatch[1]} TSS` : null;
-
-        // Get description
-        let description = null;
-        const descEl = el.querySelector('[class*="description"], [class*="Description"]');
-        if (descEl) {
-          description = descEl.textContent?.trim();
-        }
-
-        workouts.push({
-          title,
-          date,
-          duration,
-          distance,
-          tss,
-          description,
-          isPlanned,
-          details: []
-        });
+      seen.set(key, {
+        title,
+        date,
+        duration: isCompleted ? formatDurationHours(api.totalTime) : formatDurationHours(api.totalTimePlanned),
+        distance: formatDistance(api.distance || api.distancePlanned),
+        tss: (api.tssActual || api.tssPlanned) ? `${Math.round(api.tssActual || api.tssPlanned)} TSS` : null,
+        isPlanned: !isCompleted,
+        description: api.description || api.coachComments || null
       });
+    }
 
-      // Fallback: parse raw text if DOM method didn't find much
-      if (workouts.length < 3) {
-        const bodyText = document.body.innerText;
-        const lines = bodyText.split('\n').map(l => l.trim()).filter(l => l);
-
-        let currentDate = null;
-
-        for (let i = 0; i < lines.length; i++) {
-          const line = lines[i];
-
-          if (line.match(/^Today\s*\d*/)) {
-            const dayNum = line.match(/\d+/);
-            currentDate = dayNum ? `${currentMonth} ${dayNum[0]}, ${currentYear}` : 'Today';
-            continue;
-          }
-
-          if (/^\d{1,2}$/.test(line) && parseInt(line) >= 1 && parseInt(line) <= 31) {
-            currentDate = `${currentMonth} ${line}, ${currentYear}`;
-            continue;
-          }
-
-          const durationMatch = line.match(/^(\d{1,2}):(\d{2}):(\d{2})$/);
-          if (durationMatch && i > 0) {
-            const title = lines[i - 1];
-            if (title && !title.match(/^(Home|Calendar|Dashboard|Metrics|Sleep)/i) && title.length > 2) {
-              workouts.push({
-                title,
-                date: currentDate,
-                duration: line,
-                isPlanned: false,
-                distance: null,
-                tss: null,
-                description: null,
-                details: []
-              });
-            }
-          }
-        }
-      }
-
-      return {
-        workouts,
-        rawText: document.body.innerText,
-        url: window.location.href
-      };
+    const workouts = Array.from(seen.values()).sort((a, b) => {
+      if (!a.date) return 1;
+      if (!b.date) return -1;
+      return a.date.localeCompare(b.date);
     });
 
-    // Dedupe workouts by title+date, preferring completed over planned
-    const workoutMap = new Map();
-    data.workouts.forEach(w => {
-      const key = `${w.title}|${w.date}`;
-      const existing = workoutMap.get(key);
-      // Keep completed (has duration) over planned, or first one if same type
-      if (!existing || (w.duration && !existing.duration)) {
-        workoutMap.set(key, w);
-      }
-    });
-    const uniqueWorkouts = Array.from(workoutMap.values());
+    console.log(`Processed ${workouts.length} unique workouts`);
 
     return {
       user: userKey,
-      workouts: uniqueWorkouts,
-      totalCount: uniqueWorkouts.length,
-      plannedCount: uniqueWorkouts.filter(w => w.isPlanned).length,
-      completedCount: uniqueWorkouts.filter(w => !w.isPlanned && w.duration).length,
+      workouts,
+      totalCount: workouts.length,
+      plannedCount: workouts.filter(w => w.isPlanned).length,
+      completedCount: workouts.filter(w => !w.isPlanned).length,
       fetchedAt: new Date().toISOString()
     };
 
   } finally {
     await browser.close();
   }
+}
+
+function formatDurationHours(hours) {
+  if (typeof hours !== 'number' || hours <= 0) return null;
+  const totalSeconds = Math.round(hours * 3600);
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  const s = totalSeconds % 60;
+  return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+function formatDistance(meters) {
+  if (typeof meters !== 'number') return null;
+  if (meters >= 1000) {
+    return `${(meters / 1000).toFixed(1)} km`;
+  }
+  return `${Math.round(meters)} m`;
 }
 
 /**
@@ -242,7 +176,6 @@ async function getWorkouts(userKey) {
 
   const now = Date.now();
 
-  // Check user-specific cache
   if (cache[userKey] && (now - cache[userKey].timestamp) < CACHE_DURATION_MS) {
     console.log(`Returning cached workouts for ${userKey}`);
     return {
@@ -267,7 +200,7 @@ async function getWorkouts(userKey) {
  * Format workouts as Markdown
  */
 function formatAsMarkdown(data) {
-  let md = `# TrainingPeaks Workouts - ${data.user}\n\n`;
+  let md = `# TrainingPeaks Workouts - ${data.user.charAt(0).toUpperCase() + data.user.slice(1)}\n\n`;
   md += `_Last updated: ${data.fetchedAt}_\n`;
   md += `_Total: ${data.totalCount} workouts (${data.plannedCount} planned, ${data.completedCount} completed)_\n\n`;
 
@@ -278,7 +211,10 @@ function formatAsMarkdown(data) {
     byDate[date].push(w);
   });
 
-  for (const [date, workouts] of Object.entries(byDate)) {
+  const sortedDates = Object.keys(byDate).sort();
+
+  for (const date of sortedDates) {
+    const workouts = byDate[date];
     md += `## ${date}\n\n`;
     workouts.forEach(w => {
       const status = w.isPlanned ? '⏳' : '✅';
@@ -313,6 +249,10 @@ function formatAsICS(data) {
     let eventDate = parseWorkoutDate(workout.date);
     if (!eventDate) eventDate = new Date();
 
+    const nextDay = new Date(eventDate);
+    nextDay.setDate(nextDay.getDate() + 1);
+    const endDateStr = formatICSDate(nextDay);
+
     const uid = `workout-${data.user}-${index}-${eventDate.getTime()}@trainingpeaks`;
     const dateStr = formatICSDate(eventDate);
 
@@ -321,11 +261,6 @@ function formatAsICS(data) {
     if (workout.distance) description += `Distance: ${workout.distance}\n`;
     if (workout.tss) description += `TSS: ${workout.tss}\n`;
     if (workout.description) description += `\n${workout.description}`;
-
-    // For all-day events, DTEND should be the next day
-    const nextDay = new Date(eventDate);
-    nextDay.setDate(nextDay.getDate() + 1);
-    const endDateStr = formatICSDate(nextDay);
 
     lines.push('BEGIN:VEVENT');
     lines.push(`UID:${uid}`);
@@ -344,32 +279,10 @@ function formatAsICS(data) {
 
 function parseWorkoutDate(dateStr) {
   if (!dateStr) return null;
-  const now = new Date();
-  const year = now.getFullYear();
-
-  if (dateStr.toLowerCase() === 'today') return now;
-  if (dateStr.toLowerCase() === 'tomorrow') {
-    const tomorrow = new Date(now);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    return tomorrow;
-  }
-
-  // Handle ISO format "YYYY-MM-DD"
   const isoMatch = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (isoMatch) {
     return new Date(parseInt(isoMatch[1]), parseInt(isoMatch[2]) - 1, parseInt(isoMatch[3]));
   }
-
-  // Handle "Month Day, Year" format
-  const fullMatch = dateStr.match(/(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s*(\d{4})?/i);
-  if (fullMatch) {
-    const monthNames = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
-    const monthIndex = monthNames.indexOf(fullMatch[1].toLowerCase());
-    const day = parseInt(fullMatch[2]);
-    const yr = fullMatch[3] ? parseInt(fullMatch[3]) : year;
-    return new Date(yr, monthIndex, day);
-  }
-
   return null;
 }
 
@@ -389,9 +302,6 @@ function escapeICS(str) {
   return str.replace(/\\/g, '\\\\').replace(/;/g, '\\;').replace(/,/g, '\\,').replace(/\n/g, '\\n');
 }
 
-/**
- * Fold long lines per ICS spec (max 75 octets, fold with CRLF + space)
- */
 function foldICSLine(line) {
   if (line.length <= 74) return line;
 
@@ -400,7 +310,7 @@ function foldICSLine(line) {
   let first = true;
 
   while (remaining.length > 0) {
-    const maxLen = first ? 74 : 73; // subsequent lines have leading space
+    const maxLen = first ? 74 : 73;
     parts.push(remaining.slice(0, maxLen));
     remaining = remaining.slice(maxLen);
     first = false;
@@ -409,7 +319,7 @@ function foldICSLine(line) {
   return parts.join('\r\n ');
 }
 
-// Routes - order matters: most specific first
+// Routes
 app.get('/:user.ics', async (req, res) => {
   const userKey = req.params.user;
   try {
