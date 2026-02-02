@@ -368,6 +368,7 @@ app.get('/:user', async (req, res) => {
 
 app.get('/', (req, res) => {
   const users = Object.keys(USERS);
+  const s = req.query.secret;
   res.send(`
     <h1>TrainingPeaks Workout API</h1>
     <h2>Available Users</h2>
@@ -375,9 +376,9 @@ app.get('/', (req, res) => {
       ${users.map(u => `
         <li><strong>${u}</strong>
           <ul>
-            <li><a href="/${u}">/${u}</a> - JSON</li>
-            <li><a href="/${u}.md">/${u}.md</a> - Markdown</li>
-            <li><a href="/${u}.ics">/${u}.ics</a> - ICS Calendar</li>
+            <li><a href="/${u}?secret=${s}">/${u}</a> - JSON</li>
+            <li><a href="/${u}.md?secret=${s}">/${u}.md</a> - Markdown</li>
+            <li><a href="/${u}.ics?secret=${s}">/${u}.ics</a> - ICS Calendar</li>
           </ul>
         </li>
       `).join('')}
