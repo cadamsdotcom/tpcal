@@ -329,8 +329,8 @@ function formatAsICS(data) {
     lines.push(`DTSTAMP:${formatICSDateTime(new Date())}`);
     lines.push(`DTSTART;VALUE=DATE:${dateStr}`);
     lines.push(`DTEND;VALUE=DATE:${endDateStr}`);
-    lines.push(`SUMMARY:${escapeICS(workout.title)}${workout.isPlanned ? ' (Planned)' : ''}`);
-    if (description) lines.push(`DESCRIPTION:${escapeICS(description)}`);
+    lines.push(foldICSLine(`SUMMARY:${escapeICS(workout.title)}${workout.isPlanned ? ' (Planned)' : ''}`));
+    if (description) lines.push(foldICSLine(`DESCRIPTION:${escapeICS(description)}`));
     lines.push(workout.isPlanned ? 'STATUS:TENTATIVE' : 'STATUS:CONFIRMED');
     lines.push('END:VEVENT');
   });
@@ -384,6 +384,26 @@ function formatICSDateTime(date) {
 function escapeICS(str) {
   if (!str) return '';
   return str.replace(/\\/g, '\\\\').replace(/;/g, '\\;').replace(/,/g, '\\,').replace(/\n/g, '\\n');
+}
+
+/**
+ * Fold long lines per ICS spec (max 75 octets, fold with CRLF + space)
+ */
+function foldICSLine(line) {
+  if (line.length <= 74) return line;
+
+  const parts = [];
+  let remaining = line;
+  let first = true;
+
+  while (remaining.length > 0) {
+    const maxLen = first ? 74 : 73; // subsequent lines have leading space
+    parts.push(remaining.slice(0, maxLen));
+    remaining = remaining.slice(maxLen);
+    first = false;
+  }
+
+  return parts.join('\r\n ');
 }
 
 // Routes - order matters: most specific first
