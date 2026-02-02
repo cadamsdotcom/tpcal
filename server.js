@@ -300,7 +300,7 @@ function formatAsICS(data) {
     'PRODID:-//TrainingPeaks Workout Extractor//EN',
     'CALSCALE:GREGORIAN',
     'METHOD:PUBLISH',
-    `X-WR-CALNAME:TrainingPeaks - ${data.user}`,
+    `X-WR-CALNAME:TrainingPeaks - ${data.user.charAt(0).toUpperCase() + data.user.slice(1)}`,
     'X-WR-TIMEZONE:Australia/Melbourne'
   ];
 
