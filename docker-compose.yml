@@ -6,22 +6,25 @@ services:
       - .env
     expose:
       - "3000"
-
-  caddy:
-    image: caddy:2-alpine
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    environment:
-      - DOMAIN=${DOMAIN:-localhost}
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data
-      - caddy-config:/config
+    network_mode: service:tailscale
     depends_on:
-      - tpcal
+      - tailscale
+
+  tailscale:
+    image: tailscale/tailscale:latest
+    hostname: tpcal
+    restart: unless-stopped
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY}
+      - TS_HOSTNAME=tpcal
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_SERVE_CONFIG=/config/serve.json
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - ./tailscale:/config:ro
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
 
 volumes:
-  caddy-data:
-  caddy-config:
+  tailscale-state:
