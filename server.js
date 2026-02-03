@@ -140,6 +140,8 @@ async function fetchWorkoutsFromTrainingPeaks(userKey) {
       seen.set(key, {
         title,
         date,
+        type: api.workoutTypeValueId,
+        emoji: workoutEmoji(api.workoutTypeValueId),
         duration: isCompleted ? formatDurationHours(api.totalTime) : formatDurationHours(api.totalTimePlanned),
         distance: formatDistance(api.distance || api.distancePlanned),
         tss: (api.tssActual || api.tssPlanned) ? `${Math.round(api.tssActual || api.tssPlanned)} TSS` : null,
@@ -171,6 +173,18 @@ async function fetchWorkoutsFromTrainingPeaks(userKey) {
   }
 }
 
+function workoutEmoji(typeId) {
+  const emojis = {
+    1: '🏊', // Swimming
+    2: '🚴', // Cycling
+    3: '🏃', // Running
+    7: '😴', // Rest
+    9: '💪', // Strength
+    100: '🔄' // Transition
+  };
+  return emojis[typeId] || '🏋️';
+}
+
 function formatDurationHours(hours) {
   if (typeof hours !== 'number' || hours <= 0) return null;
   const totalSeconds = Math.round(hours * 3600);
@@ -191,23 +205,37 @@ function formatDistance(meters) {
 function formatSteps(structure) {
   if (!structure?.structure) return null;
 
+  const formatLen = (len) => {
+    if (!len) return '';
+    if (len.unit === 'meter') return `${len.value}m`;
+    if (len.unit === 'second') return `${len.value}s`;
+    if (len.unit === 'minute') return `${len.value}min`;
+    return `${len.value} ${len.unit}`;
+  };
+
+  const formatStep = (step) => {
+    const name = step.name || step.intensityClass || 'Step';
+    const duration = formatLen(step.length);
+    const notes = step.notes ? ` - ${step.notes}` : '';
+    return `${name}${duration ? ` (${duration})` : ''}${notes}`;
+  };
+
   const steps = [];
   for (const block of structure.structure) {
     const reps = block.length?.unit === 'repetition' ? block.length.value : 1;
-    const prefix = reps > 1 ? `${reps}x ` : '';
+    const blockSteps = block.steps || [];
 
-    for (const step of (block.steps || [])) {
-      const name = step.name || step.intensityClass || 'Step';
-      const len = step.length;
-      let duration = '';
-      if (len) {
-        if (len.unit === 'meter') duration = `${len.value}m`;
-        else if (len.unit === 'second') duration = `${len.value}s`;
-        else if (len.unit === 'minute') duration = `${len.value}min`;
-        else duration = `${len.value} ${len.unit}`;
-      }
-      const notes = step.notes ? ` - ${step.notes}` : '';
-      steps.push(`${prefix}${name}${duration ? ` (${duration})` : ''}${notes}`);
+    if (blockSteps.length === 0) continue;
+
+    if (blockSteps.length === 1) {
+      // Single step
+      const prefix = reps > 1 ? `${reps}x ` : '';
+      steps.push(`${prefix}${formatStep(blockSteps[0])}`);
+    } else {
+      // Multiple steps grouped together
+      const grouped = blockSteps.map(formatStep).join(' + ');
+      const prefix = reps > 1 ? `${reps}x ` : '';
+      steps.push(`${prefix}[${grouped}]`);
     }
   }
   return steps.length > 0 ? steps : null;
@@ -263,7 +291,7 @@ function formatAsMarkdown(data) {
     md += `## ${date}\n\n`;
     workouts.forEach(w => {
       const status = w.isPlanned ? '⏳' : '✅';
-      md += `### ${status} ${w.title}\n\n`;
+      md += `### ${w.emoji} ${status} ${w.title}\n\n`;
       if (w.duration) md += `- **Duration:** ${w.duration}\n`;
       if (w.distance) md += `- **Distance:** ${w.distance}\n`;
       if (w.tss) md += `- **TSS:** ${w.tss}\n`;
@@ -314,7 +342,7 @@ function formatAsICS(data) {
     lines.push(`DTSTAMP:${formatICSDateTime(new Date())}`);
     lines.push(`DTSTART;VALUE=DATE:${dateStr}`);
     lines.push(`DTEND;VALUE=DATE:${endDateStr}`);
-    lines.push(foldICSLine(`SUMMARY:${escapeICS(workout.title)}${workout.isPlanned ? ' (Planned)' : ''}`));
+    lines.push(foldICSLine(`SUMMARY:${workout.emoji} ${escapeICS(workout.title)}${workout.isPlanned ? ' (Planned)' : ''}`));
     if (description) lines.push(foldICSLine(`DESCRIPTION:${escapeICS(description)}`));
     lines.push(workout.isPlanned ? 'STATUS:TENTATIVE' : 'STATUS:CONFIRMED');
     lines.push('END:VEVENT');
