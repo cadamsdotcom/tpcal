@@ -64,20 +64,27 @@ async function fetchWorkoutsFromTrainingPeaks(userKey) {
   const page = await context.newPage();
 
   try {
-    // Intercept API responses to get full workout data
+    // Intercept API responses
     const apiWorkouts = [];
+    let athleteSettings = null;
     page.on('response', async (response) => {
       const url = response.url();
-      if (url.includes('/workouts') || url.includes('/activities')) {
-        try {
-          const json = await response.json();
+      if (!url.includes('trainingpeaks')) return;
+      try {
+        const json = await response.json();
+        // Capture athlete settings (contains FTP)
+        if (url.includes('/athletes/') && url.includes('/settings')) {
+          athleteSettings = json;
+        }
+        // Extract workouts
+        if (url.includes('/workouts') || url.includes('/activities')) {
           if (Array.isArray(json)) {
             apiWorkouts.push(...json);
           } else if (json.workouts) {
             apiWorkouts.push(...json.workouts);
           }
-        } catch (e) {}
-      }
+        }
+      } catch (e) {}
     });
 
     // Login
@@ -131,7 +138,7 @@ async function fetchWorkoutsFromTrainingPeaks(userKey) {
             existing.description = api.description;
           }
           if (!existing.steps && api.structure) {
-            existing.steps = formatSteps(api.structure);
+            existing.steps = formatSteps(api.structure, api.workoutTypeValueId, athleteSettings);
           }
         }
         continue;
@@ -147,7 +154,7 @@ async function fetchWorkoutsFromTrainingPeaks(userKey) {
         tss: (api.tssActual || api.tssPlanned) ? `${Math.round(api.tssActual || api.tssPlanned)} TSS` : null,
         isPlanned: !isCompleted,
         description: api.description || api.coachComments || null,
-        steps: formatSteps(api.structure)
+        steps: formatSteps(api.structure, api.workoutTypeValueId, athleteSettings)
       });
     }
 
@@ -202,22 +209,60 @@ function formatDistance(meters) {
   return `${Math.round(meters)} m`;
 }
 
-function formatSteps(structure) {
+function formatSteps(structure, workoutType, athleteSettings) {
   if (!structure?.structure) return null;
+
+  // Get FTP for power-based workouts (cycling = type 2)
+  let ftp = null;
+  if (workoutType === 2 && athleteSettings?.powerZones) {
+    const powerZone = athleteSettings.powerZones.find(z => z.workoutTypeId === 2);
+    if (powerZone) {
+      ftp = powerZone.threshold;
+    }
+  }
 
   const formatLen = (len) => {
     if (!len) return '';
-    if (len.unit === 'meter') return `${len.value}m`;
+    if (len.unit === 'meter') {
+      return len.value >= 1000 ? `${len.value / 1000}km` : `${len.value}m`;
+    }
     if (len.unit === 'second') return `${len.value}s`;
     if (len.unit === 'minute') return `${len.value}min`;
     return `${len.value} ${len.unit}`;
   };
 
+  const formatTarget = (targets) => {
+    if (!targets || !targets[0]) return '';
+    const t = targets[0];
+
+    // For cycling (type 2) with FTP, show both percentage and watts
+    if (workoutType === 2 && ftp && t.minValue > 10) {
+      // Values > 10 are likely percentages (FTP%) not RPE
+      if (t.maxValue) {
+        const minWatts = Math.round(ftp * t.minValue / 100);
+        const maxWatts = Math.round(ftp * t.maxValue / 100);
+        return ` @ ${t.minValue}-${t.maxValue}% (${minWatts}-${maxWatts}W)`;
+      } else {
+        const watts = Math.round(ftp * t.minValue / 100);
+        return ` @ ${t.minValue}% (${watts}W)`;
+      }
+    }
+
+    // For other sports or low values (RPE), just show the value
+    if (t.minValue && t.maxValue) {
+      return ` @ ${t.minValue}-${t.maxValue}`;
+    } else if (t.minValue) {
+      return ` @ ${t.minValue}`;
+    }
+    return '';
+  };
+
   const formatStep = (step) => {
     const name = step.name || step.intensityClass || 'Step';
     const duration = formatLen(step.length);
+    const target = formatTarget(step.targets);
     const notes = step.notes ? ` - ${step.notes}` : '';
-    return `${name}${duration ? ` (${duration})` : ''}${notes}`;
+    return `${name}${duration ? ` (${duration})` : ''}${target}${notes}`;
   };
 
   const steps = [];
