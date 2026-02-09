@@ -224,10 +224,16 @@ function formatSteps(structure, workoutType, athleteSettings) {
   const formatLen = (len) => {
     if (!len) return '';
     if (len.unit === 'meter') {
-      return len.value >= 1000 ? `${len.value / 1000}km` : `${len.value}m`;
+      return len.value >= 1000 ? `${len.value / 1000} km` : `${len.value} m`;
     }
-    if (len.unit === 'second') return `${len.value}s`;
-    if (len.unit === 'minute') return `${len.value}min`;
+    if (len.unit === 'second') {
+      const mins = Math.floor(len.value / 60);
+      const secs = len.value % 60;
+      if (mins > 0 && secs > 0) return `${mins}:${String(secs).padStart(2, '0')}`;
+      if (mins > 0) return `${mins} min`;
+      return `0:${String(secs).padStart(2, '0')}`;
+    }
+    if (len.unit === 'minute') return `${len.value} min`;
     return `${len.value} ${len.unit}`;
   };
 
@@ -248,21 +254,40 @@ function formatSteps(structure, workoutType, athleteSettings) {
       }
     }
 
-    // For other sports or low values (RPE), just show the value
+    // For other sports, add RPE suffix
     if (t.minValue && t.maxValue) {
-      return ` @ ${t.minValue}-${t.maxValue}`;
+      return ` @ ${t.minValue}-${t.maxValue} RPE`;
     } else if (t.minValue) {
-      return ` @ ${t.minValue}`;
+      return ` @ ${t.minValue} RPE`;
     }
     return '';
   };
 
-  const formatStep = (step) => {
+  // Format a single step as multi-line
+  const formatStepMultiline = (step, indent = '') => {
     const name = step.name || step.intensityClass || 'Step';
     const duration = formatLen(step.length);
     const target = formatTarget(step.targets);
-    const notes = step.notes ? ` - ${step.notes}` : '';
-    return `${name}${duration ? ` (${duration})` : ''}${target}${notes}`;
+    const lines = [name];
+    if (duration || target) {
+      lines.push(`${indent}${duration}${target}`);
+    }
+    if (step.notes) {
+      lines.push(`${indent}Notes - ${step.notes}`);
+    }
+    return lines.join('\n');
+  };
+
+  // Format step for bullet point (single line)
+  const formatStepBullet = (step) => {
+    const name = step.name || step.intensityClass || 'Step';
+    const duration = formatLen(step.length);
+    const target = formatTarget(step.targets);
+    let line = `${name} ${duration}${target}`;
+    if (step.notes) {
+      line += `\n      Notes - ${step.notes}`;
+    }
+    return line;
   };
 
   const steps = [];
@@ -274,13 +299,24 @@ function formatSteps(structure, workoutType, athleteSettings) {
 
     if (blockSteps.length === 1) {
       // Single step
-      const prefix = reps > 1 ? `${reps}x ` : '';
-      steps.push(`${prefix}${formatStep(blockSteps[0])}`);
+      const step = blockSteps[0];
+      const name = step.name || step.intensityClass || 'Step';
+      const duration = formatLen(step.length);
+      const target = formatTarget(step.targets);
+
+      let stepText = reps > 1 ? `${reps}x ${name}` : name;
+      if (duration || target) {
+        stepText += `\n   ${duration}${target}`;
+      }
+      if (step.notes) {
+        stepText += `\n   Notes - ${step.notes}`;
+      }
+      steps.push(stepText);
     } else {
-      // Multiple steps grouped together
-      const grouped = blockSteps.map(formatStep).join(' + ');
-      const prefix = reps > 1 ? `${reps}x ` : '';
-      steps.push(`${prefix}[${grouped}]`);
+      // Multiple steps grouped - use "Repeat X times" with bullets
+      const header = reps > 1 ? `Repeat ${reps} times` : 'Set';
+      const bullets = blockSteps.map(s => `   • ${formatStepBullet(s)}`).join('\n');
+      steps.push(`${header}\n${bullets}`);
     }
   }
   return steps.length > 0 ? steps : null;
