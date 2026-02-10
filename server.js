@@ -221,6 +221,15 @@ function formatSteps(structure, workoutType, athleteSettings) {
     }
   }
 
+  // Get threshold pace for running (type 3) - stored as m/s
+  let runThreshold = null;
+  if (workoutType === 3 && athleteSettings?.speedZones) {
+    const speedZone = athleteSettings.speedZones.find(z => z.workoutTypeId === 3);
+    if (speedZone) {
+      runThreshold = speedZone.threshold;
+    }
+  }
+
   const formatLen = (len) => {
     if (!len) return '';
     if (len.unit === 'meter') {
@@ -254,7 +263,24 @@ function formatSteps(structure, workoutType, athleteSettings) {
       }
     }
 
-    // For other sports, add RPE suffix
+    // For running (type 3) with threshold, convert pace percentages to min/km
+    if (workoutType === 3 && runThreshold && t.minValue > 10) {
+      const paceFromPercent = (pct) => {
+        const speed = runThreshold * pct / 100;  // m/s
+        const secPerKm = 1000 / speed;
+        const mins = Math.floor(secPerKm / 60);
+        const secs = Math.round(secPerKm % 60);
+        return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+      };
+      // Lower % = slower speed = higher pace number, so swap min/max for display
+      if (t.maxValue) {
+        return ` @ ${paceFromPercent(t.maxValue)}-${paceFromPercent(t.minValue)} min/km`;
+      } else {
+        return ` @ ${paceFromPercent(t.minValue)} min/km`;
+      }
+    }
+
+    // For swimming or low values, show as RPE
     if (t.minValue && t.maxValue) {
       return ` @ ${t.minValue}-${t.maxValue} RPE`;
     } else if (t.minValue) {
