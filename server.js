@@ -1,8 +1,17 @@
-const { chromium } = require('playwright');
 const express = require('express');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// TrainingPeaks endpoints
+const HOME_BASE = 'https://home.trainingpeaks.com';
+const API_BASE = 'https://tpapi.trainingpeaks.com';
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+// How much of the calendar to pull, in days relative to today
+const DAYS_BACK = parseInt(process.env.TP_DAYS_BACK || '30', 10);
+const DAYS_FORWARD = parseInt(process.env.TP_DAYS_FORWARD || '60', 10);
 
 // Load users from environment variables
 function loadUsersFromEnv() {
@@ -50,103 +59,149 @@ function requireSecret(req, res, next) {
 
 app.use(requireSecret);
 
+// --- Minimal cookie jar helpers (name -> value) ---
+function mergeSetCookies(jar, setCookieList) {
+  for (const sc of setCookieList || []) {
+    const pair = sc.split(';')[0];
+    const eq = pair.indexOf('=');
+    if (eq === -1) continue;
+    jar[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim();
+  }
+}
+
+function cookieHeader(jar) {
+  return Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+// Calendar window (YYYY-MM-DD) relative to today
+function calendarRange() {
+  const fmt = (d) => d.toISOString().split('T')[0];
+  const start = new Date();
+  start.setDate(start.getDate() - DAYS_BACK);
+  const end = new Date();
+  end.setDate(end.getDate() + DAYS_FORWARD);
+  return { start: fmt(start), end: fmt(end) };
+}
+
 /**
- * Fetches workouts from TrainingPeaks for a specific user
+ * Logs in to TrainingPeaks over HTTP (no browser) and returns the API bearer
+ * token plus the athlete id.
+ *
+ * The login page carries an anti-CSRF token and, since mid-2026, an (invisible)
+ * reCAPTCHA v3 challenge and MFA fields. reCAPTCHA v3 is score-based and the
+ * form submits fine with an empty CaptchaToken, so we post the standard fields
+ * and let the server score the request.
+ */
+async function loginToTrainingPeaks(userKey) {
+  const user = USERS[userKey];
+  const jar = {};
+
+  // 1. Load the login page for the CSRF token + verification cookie
+  const pageResp = await fetch(`${HOME_BASE}/login`, { headers: { 'User-Agent': USER_AGENT } });
+  mergeSetCookies(jar, pageResp.headers.getSetCookie());
+  const html = await pageResp.text();
+  const csrf = html.match(/name="__RequestVerificationToken"[^>]*value="([^"]+)"/)?.[1];
+  if (!csrf) {
+    throw new Error('Login page structure changed: could not find __RequestVerificationToken');
+  }
+
+  // 2. Post credentials
+  const body = new URLSearchParams({
+    __RequestVerificationToken: csrf,
+    CaptchaHidden: 'true',
+    CaptchaToken: '',
+    Attempts: '',
+    SelectedMfaMethod: '',
+    Username: user.username,
+    Password: user.password
+  });
+  const loginResp = await fetch(`${HOME_BASE}/login`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: {
+      'User-Agent': USER_AGENT,
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Cookie': cookieHeader(jar)
+    },
+    body
+  });
+  mergeSetCookies(jar, loginResp.headers.getSetCookie());
+
+  // 3. Success is signalled by the auth cookie. If it's missing, explain why.
+  if (!jar['Production_tpAuth']) {
+    const location = loginResp.headers.get('location') || '';
+    const respHtml = await loginResp.text().catch(() => '');
+    let reason = `HTTP ${loginResp.status}${location ? `, redirect -> ${location}` : ''}`;
+    if (/loginfailed/i.test(location) || /invalid|incorrect/i.test(respHtml)) {
+      reason += ' (invalid username or password)';
+    } else if (/mfa|multi-factor|verification code|SelectedMfaMethod/i.test(respHtml)) {
+      reason += ' (account requires MFA, which this tool does not support)';
+    } else if (/captcha|recaptcha|are you a robot/i.test(respHtml)) {
+      reason += ' (blocked by captcha)';
+    }
+    throw new Error(`Login failed for ${userKey}: ${reason}`);
+  }
+  console.log(`[${userKey}] Login OK`);
+
+  // 4. Exchange the session cookie for an API bearer token
+  const tokenResp = await fetch(`${API_BASE}/users/v3/token`, {
+    headers: { 'User-Agent': USER_AGENT, 'Cookie': cookieHeader(jar) }
+  });
+  if (!tokenResp.ok) throw new Error(`Token request failed: HTTP ${tokenResp.status}`);
+  const bearer = (await tokenResp.json())?.token?.access_token;
+  if (!bearer) throw new Error('No access_token returned by /users/v3/token');
+
+  // 5. Look up the athlete id
+  const userResp = await fetch(`${API_BASE}/users/v3/user`, {
+    headers: { 'User-Agent': USER_AGENT, 'Authorization': `Bearer ${bearer}` }
+  });
+  if (!userResp.ok) throw new Error(`User lookup failed: HTTP ${userResp.status}`);
+  const athleteId = (await userResp.json())?.user?.userId;
+  if (!athleteId) throw new Error('Could not determine athlete id from /users/v3/user');
+
+  return { bearer, athleteId };
+}
+
+/**
+ * Fetches workouts from TrainingPeaks for a specific user via the public app API.
  */
 async function fetchWorkoutsFromTrainingPeaks(userKey) {
   const user = USERS[userKey];
   if (!user) throw new Error(`Unknown user: ${userKey}`);
 
-  console.log(`Fetching workouts for ${userKey}...`);
+  console.log(`[${userKey}] Fetching workouts...`);
+  const { bearer, athleteId } = await loginToTrainingPeaks(userKey);
+  const authHeaders = { 'User-Agent': USER_AGENT, 'Authorization': `Bearer ${bearer}` };
 
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext();
-  const page = await context.newPage();
-
+  // Athlete settings hold FTP / threshold pace used to resolve power & pace targets.
+  let athleteSettings = null;
   try {
-    // Intercept API responses
-    const apiWorkouts = [];
-    let athleteSettings = null;
-    page.on('response', async (response) => {
-      const url = response.url();
-      if (!url.includes('trainingpeaks')) return;
-      try {
-        const json = await response.json();
-        // Capture athlete settings (contains FTP)
-        if (url.includes('/athletes/') && url.includes('/settings')) {
-          athleteSettings = json;
-        }
-        // Extract workouts
-        if (url.includes('/workouts') || url.includes('/activities')) {
-          if (Array.isArray(json)) {
-            apiWorkouts.push(...json);
-          } else if (json.workouts) {
-            apiWorkouts.push(...json.workouts);
-          }
-        }
-      } catch (e) {}
-    });
-
-    // Login
-    await page.goto('https://home.trainingpeaks.com/login');
-    await page.waitForSelector('input[name="Username"], input[type="email"]', { timeout: 15000 });
-
-    await page.fill('input[name="Username"], input[type="email"]', user.username);
-    await page.fill('input[name="Password"], input[type="password"]', user.password);
-    await page.click('button[type="submit"]');
-
-    // Wait for app to load
-    await page.waitForURL('**/app.trainingpeaks.com/**', { timeout: 30000 }).catch(() => {});
-    await page.waitForTimeout(4000);
-
-    // Navigate to calendar to trigger API calls
-    console.log('Navigating to calendar...');
-    try {
-      await page.click('text=Calendar', { timeout: 5000 });
-      await page.waitForTimeout(4000);
-    } catch (e) {
-      await page.evaluate(() => { window.location.hash = '/calendar'; });
-      await page.waitForTimeout(4000);
+    const settingsResp = await fetch(`${API_BASE}/fitness/v1/athletes/${athleteId}/settings`, { headers: authHeaders });
+    if (settingsResp.ok) {
+      athleteSettings = await settingsResp.json();
+    } else {
+      console.warn(`[${userKey}] settings HTTP ${settingsResp.status} - power/pace targets will fall back to RPE`);
     }
+  } catch (e) {
+    console.warn(`[${userKey}] settings fetch error: ${e.message}`);
+  }
 
-    // Wait for API calls to complete
-    await page.waitForTimeout(2000);
-    console.log(`Intercepted ${apiWorkouts.length} workouts from API`);
+  // Workouts across the calendar window
+  const { start, end } = calendarRange();
+  console.log(`[${userKey}] Fetching workouts ${start} -> ${end} for athlete ${athleteId}`);
+  const woResp = await fetch(`${API_BASE}/fitness/v6/athletes/${athleteId}/workouts/${start}/${end}`, { headers: authHeaders });
+  if (!woResp.ok) throw new Error(`Workouts request failed: HTTP ${woResp.status}`);
+  const apiWorkouts = await woResp.json();
+  console.log(`[${userKey}] Retrieved ${Array.isArray(apiWorkouts) ? apiWorkouts.length : 0} workouts from API`);
 
-    // Process API workouts into our format
-    // First pass: collect all workouts, merging planned details into completed
-    const seen = new Map();
-    for (const api of apiWorkouts) {
-      const date = api.workoutDay?.split('T')[0] || null;
-      const title = api.title || 'Workout';
-      const key = `${title}|${date}`;
-      const isCompleted = api.totalTime && api.totalTime > 0;
-
-      const existing = seen.get(key);
-
-      // Merge: if we have a completed and planned version, combine them
-      if (existing) {
-        if (isCompleted && existing.isPlanned) {
-          // Completed version - keep planned description, update with actual data
-          existing.isPlanned = false;
-          existing.duration = formatDurationHours(api.totalTime);
-          existing.distance = api.distance ? formatDistance(api.distance) : existing.distance;
-          existing.tss = api.tssActual ? `${Math.round(api.tssActual)} TSS` : existing.tss;
-        } else if (!isCompleted && !existing.isPlanned) {
-          // Planned version, but we already have completed - merge description and steps
-          if (!existing.description && api.description) {
-            existing.description = api.description;
-          }
-          if (!existing.steps && api.structure) {
-            existing.steps = formatSteps(api.structure, api.workoutTypeValueId, athleteSettings);
-          }
-        }
-        continue;
-      }
-
-      seen.set(key, {
-        title,
-        date,
+  // Each API record already unifies planned + actual data, so map directly.
+  const workouts = (Array.isArray(apiWorkouts) ? apiWorkouts : [])
+    .filter(api => !api.isHidden)
+    .map(api => {
+      const isCompleted = typeof api.totalTime === 'number' && api.totalTime > 0;
+      return {
+        title: api.title || 'Workout',
+        date: api.workoutDay?.split('T')[0] || null,
         type: api.workoutTypeValueId,
         emoji: workoutEmoji(api.workoutTypeValueId),
         duration: isCompleted ? formatDurationHours(api.totalTime) : formatDurationHours(api.totalTimePlanned),
@@ -155,29 +210,24 @@ async function fetchWorkoutsFromTrainingPeaks(userKey) {
         isPlanned: !isCompleted,
         description: api.description || api.coachComments || null,
         steps: formatSteps(api.structure, api.workoutTypeValueId, athleteSettings)
-      });
-    }
-
-    const workouts = Array.from(seen.values()).sort((a, b) => {
+      };
+    })
+    .sort((a, b) => {
       if (!a.date) return 1;
       if (!b.date) return -1;
       return a.date.localeCompare(b.date);
     });
 
-    console.log(`Processed ${workouts.length} unique workouts`);
+  console.log(`[${userKey}] Processed ${workouts.length} workouts`);
 
-    return {
-      user: userKey,
-      workouts,
-      totalCount: workouts.length,
-      plannedCount: workouts.filter(w => w.isPlanned).length,
-      completedCount: workouts.filter(w => !w.isPlanned).length,
-      fetchedAt: new Date().toISOString()
-    };
-
-  } finally {
-    await browser.close();
-  }
+  return {
+    user: userKey,
+    workouts,
+    totalCount: workouts.length,
+    plannedCount: workouts.filter(w => w.isPlanned).length,
+    completedCount: workouts.filter(w => !w.isPlanned).length,
+    fetchedAt: new Date().toISOString()
+  };
 }
 
 function workoutEmoji(typeId) {
